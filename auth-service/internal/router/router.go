@@ -1,78 +1,77 @@
 package router
 
 import (
-    "auth-service/internal/config"
-    "auth-service/internal/handler"
-    "auth-service/internal/middleware"
-    "auth-service/internal/repository"
-    "auth-service/internal/service"
-    "database/sql"
-    "time"
+	"auth-service/internal/handler"
+	"auth-service/internal/middleware"
+	"auth-service/internal/repository"
+	"auth-service/internal/service"
+	"database/sql"
+	"time"
 
-    "github.com/gin-contrib/cors"
-    "github.com/gin-gonic/gin"
-    "github.com/golang-jwt/jwt/v5"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 )
 
-type ValidateResponse struct {
-    ID        int64  `json:"id"`
-    Name      string `json:"name"`
-    Email     string `json:"email"`
-    Issuer    string `json:"issuer"`
-    IssuedAt  string `json:"issued_at"`
-    ExpiresAt string `json:"expires_at"`
-}
+// SetupRouter mengkonfigurasi semua route aplikasi
+func SetupRouter(db *sql.DB, jwtSecret, jwtIssuer string, jwtExpiry time.Duration) *gin.Engine {
+	// Inisialisasi repository
+	userRepo := repository.NewUserRepository(db)
 
-func SetupRouter(cfg *config.Config, db *sql.DB) *gin.Engine {
-    r := gin.Default()
+	// Jalankan migration
+	err := userRepo.Migrate()
+	if err != nil {
+		panic("Failed to migrate database: " + err.Error())
+	}
 
-    // Pasang middleware CORS global (untuk cross-platform)
-    r.Use(cors.New(cors.Config{
-        AllowOrigins:     []string{"*"}, // ganti nanti ke domain produksi
-        AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-        AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-        ExposeHeaders:    []string{"Content-Length"},
-        AllowCredentials: true,
-        MaxAge:           12 * time.Hour,
-    }))
+	// Inisialisasi service
+	authService := service.NewAuthService(userRepo, jwtSecret, jwtIssuer, jwtExpiry)
 
-    repo := repository.New(db)
-    svc := service.New(repo, cfg)
-    h := handler.New(svc)
+	// Inisialisasi handler
+	authHandler := handler.NewAuthHandler(authService, jwtSecret, jwtExpiry)
 
-    // Group API biar rapi
-    api := r.Group("/api")
-    {
-        api.POST("/register", h.Register)
-        api.POST("/login", h.Login)
+	// Inisialisasi middleware
+	jwtAuthMiddleware := middleware.NewJWTAuthMiddleware(authService)
 
-        // Endpoint validasi token
-        api.GET("/validate", middleware.JWTAuth(cfg.JWTSecret), func(c *gin.Context) {
-            claims := c.MustGet("claims").(jwt.MapClaims)
+	// Buat router
+	router := gin.Default()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		panic("Failed to set trusted proxies: " + err.Error())
+	}
 
-            // Ambil nilai dari token
-            id := int64(claims["sub"].(float64))
-            name := claims["name"].(string)
-            email := claims["email"].(string)
-            iss := claims["iss"].(string)
-            iat := int64(claims["iat"].(float64))
-            exp := int64(claims["exp"].(float64))
+	// Setup CORS middleware - IMPORTANT!
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:3000", "http://localhost:3001"}, // Port Next.js
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization", "Accept"},
+		AllowCredentials: true, // Penting untuk cookie HttpOnly
+		MaxAge:           12 * time.Hour,
+	}))
 
-            // Format waktu
-            issuedAt := time.Unix(iat, 0).Format("2006-01-02 15:04:05")
-            expiresAt := time.Unix(exp, 0).Format("2006-01-02 15:04:05")
+	// Route untuk health check
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "OK"})
+	})
 
-            resp := ValidateResponse{
-                ID:        id,
-                Name:      name,
-                Email:     email,
-                Issuer:    iss,
-                IssuedAt:  issuedAt,
-                ExpiresAt: expiresAt,
-            }
-            c.JSON(200, resp)
-        })
-    }
+	// Handle OPTIONS requests untuk semua route (fallback)
+	router.OPTIONS("/*any", func(c *gin.Context) {
+		c.Status(200)
+	})
 
-    return r
+	// Grup route API
+	api := router.Group("/api")
+	{
+		// Public routes
+		api.POST("/register", authHandler.Register)
+		api.POST("/login", authHandler.Login)
+
+		// Protected routes (memerlukan JWT)
+		protected := api.Group("")
+		protected.Use(jwtAuthMiddleware.Middleware())
+		{
+			protected.POST("/logout", authHandler.Logout)
+			protected.GET("/validate", authHandler.Validate)
+		}
+	}
+
+	return router
 }
